@@ -50,78 +50,58 @@ jobs:
     - name: Apply Mojang patches (decompile+patch)
       run: ./gradlew youer:applyPatches
 
-    - name: Normalize ACK variable for getSequence()
+    - name: Inject guard into ServerGamePacketListenerImpl.java
       shell: bash
       run: |
         set -euo pipefail
         T=projects/youer/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
 
-        # 從方法頭找參數名：handleUseItemOn(ServerboundUseItemOnPacket <VAR>)
-        VAR_FROM_HEADER="$(awk '
-          /handleUseItemOn[ \t]*\(/,/\)/ {
-            if ($0 ~ /ServerboundUseItemOnPacket/) {
-              for (i=1;i<=NF;i++) if ($i ~ /ServerboundUseItemOnPacket/) {
-                if (i+1<=NF) { v=$(i+1); gsub(/[,)\r;]/,"",v); print v; exit }
-              }
-            }
+        if grep -q 'OLDIP fix (Youer #117)' "$T"; then
+          echo "Guard already present, skipping injection."
+          exit 0
+        fi
+
+        # 先找「int <SEQINT> = <SEQVAR>.getSequence();」左邊變數名稱
+        SEQINT=$(grep -Pom1 'int\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.getSequence\(\);' "$T" \
+                 | sed -E 's/int\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*/\1/')
+        # 再找「<SEQVAR>.getSequence()」裡的變數名稱
+        SEQVAR=$(grep -Po '[A-Za-z_][A-Za-z0-9_]*\.getSequence\(\)' "$T" | head -n1 | sed -E 's/\.getSequence\(\)//')
+
+        if [[ -n "${SEQINT:-}" ]]; then
+          ACKARG="$SEQINT"
+        elif [[ -n "${SEQVAR:-}" ]]; then
+          ACKARG="${SEQVAR}.getSequence()"
+        else
+          echo "Cannot locate sequence variable in $T"; exit 1
+        fi
+
+        # 確認錨點存在（useItemOn 呼叫）
+        grep -n '\.useItemOn(this\.player, serverlevel, itemstack, interactionhand, blockhitresult);' "$T"
+
+        awk -v ACKARG="$ACKARG" '
+          { print }
+          /\.useItemOn\(this\.player, serverlevel, itemstack, interactionhand, blockhitresult\);/ && !injected {
+            print "                                 // OLDIP fix (Youer #117): avoid armor auto-equip & dupes on iron/gold blocks"
+            print "                                 // If block interaction consumed the action, do NOT fall back to air-use."
+            print "                                 // ACK the sequence and sync inventory to avoid client resends/ghosts."
+            print "                                 if (interactionresult.consumesAction()) {"
+            print "                                     this.ackBlockChangesUpTo(" ACKARG ");"
+            print "                                     this.player.containerMenu.broadcastChanges();"
+            print "                                     return;"
+            print "                                 }"
+            print "                                 // Guard: holding armor and clicking iron/gold blocks should not run armor air-use."
+            print "                                 if (itemstack.getItem() instanceof net.minecraft.world.item.ArmorItem"
+            print "                                         && (serverlevel.getBlockState(blockpos).is(net.minecraft.world.level.block.Blocks.IRON_BLOCK)"
+            print "                                         || serverlevel.getBlockState(blockpos).is(net.minecraft.world.level.block.Blocks.GOLD_BLOCK))) {"
+            print "                                     this.ackBlockChangesUpTo(" ACKARG ");"
+            print "                                     this.player.containerMenu.broadcastChanges();"
+            print "                                     this.player.swing(interactionhand, true);"
+            print "                                     return;"
+            print "                                 }"
+            injected=1
           }
-        ' "$T")"
-
-        # 若頭找不到，再從已存在的呼叫點抓：<var>.getSequence()
-        if [ -z "${VAR_FROM_HEADER}" ]; then
-          VAR_FROM_CALL="$(grep -oP '[A-Za-z_][A-Za-z_0-9]*\s*\.\s*getSequence\(\)' "$T" | head -n1 | sed -E 's/\s//g;s/\.getSequence\(\)//')"
-        else
-          VAR_FROM_CALL=""
-        fi
-
-        SEQVAR="${VAR_FROM_HEADER:-$VAR_FROM_CALL}"
-        echo "Sequence var: ${SEQVAR:-<none>}"
-
-        if [ -n "${SEQVAR:-}" ]; then
-          # 1) 修正舊注入殘留的 packet.getSequence()
-          sed -i -E "s/\backBlockChangesUpTo\s*\(\s*packet\.getSequence\(\)\s*\)/ackBlockChangesUpTo(${SEQVAR}.getSequence())/g" "$T"
-          # 2) 若我們這次用了占位符 __SEQVAR__，也一併替換
-          sed -i "s/__SEQVAR__/${SEQVAR//\//\\/}/g" "$T"
-        else
-          # 找不到就刪掉 ACK 行，避免編譯錯，行為仍保護（保留 broadcastChanges()+return）
-          sed -i -E '/ackBlockChangesUpTo\s*\(\s*[A-Za-z_][A-Za-z_0-9]*\.getSequence\(\)\s*\)\s*;/d' "$T"
-          sed -i -E '/ackBlockChangesUpTo\s*\(\s*__SEQVAR__\.getSequence\(\)\s*\)\s*;/d' "$T"
-        fi
-
-
-        # 3) 嘗試偵測真正的參數變數名：handleUseItemOn(ServerboundUseItemOnPacket <VAR>)
-        VAR_FROM_HEADER="$(awk '
-          /void[ \t]+handleUseItemOn[ \t]*\(/,/\)/ {
-            if ($0 ~ /ServerboundUseItemOnPacket/) {
-              for (i=1;i<=NF;i++) {
-                if ($i ~ /ServerboundUseItemOnPacket/) {
-                  if (i+1<=NF) {
-                    v=$(i+1); gsub(/[),]/,"",v); print v; exit
-                  }
-                }
-              }
-            }
-          }
-        ' "$T")"
-
-        # 4) 如果找不到，嘗試從 getSequence() 的呼叫點抓變數名
-        if [ -z "${VAR_FROM_HEADER}" ]; then
-          VAR_FROM_CALL="$(grep -oP '[A-Za-z_][A-Za-z_0-9]*\s*\.\s*getSequence\(\)' "$T" | head -n1 | sed -E 's/\s//g;s/\.getSequence\(\)//')"
-        else
-          VAR_FROM_CALL=""
-        fi
-
-        SEQVAR="${VAR_FROM_HEADER:-$VAR_FROM_CALL}"
-        echo "Detected sequence var: ${SEQVAR:-<none>}"
-
-        if [ -n "${SEQVAR:-}" ]; then
-          # 用偵測到的變數替換占位符
-          sed -i "s/__SEQVAR__/${SEQVAR//\//\\/}/g" "$T"
-        else
-          # 找不到就移除 ACK 行，避免編譯錯
-          sed -i '/ackBlockChangesUpTo(__SEQVAR__\.getSequence())/d' "$T"
-          sed -i 's/__SEQVAR__\.getSequence()//g' "$T"
-        fi
+        ' "$T" > "$T.new"
+        mv "$T.new" "$T"
 
     - name: Generate patches
       run: ./gradlew genPatches
