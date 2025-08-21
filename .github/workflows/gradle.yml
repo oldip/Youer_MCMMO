@@ -8,25 +8,37 @@
 name: Java CI with Gradle
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "1.21.1" ]
+    branches: [ "1.21.1", "fix_mcMMO_repair/salvage" ]
   pull_request:
-    branches: [ "1.21.1" ]
-
+    branches: [ "1.21.1", "fix_mcMMO_repair/salvage" ]
+    
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  
 jobs:
   build:
 
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0   # 之後要 git commit/push 必須拿到歷史
+        
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
+
+    - name: Setup Gradle (cache)
+      uses: gradle/actions/setup-gradle@v4
 
     # Configure Gradle for optimal use in GitHub Actions, including caching of downloaded dependencies.
     # See: https://github.com/gradle/actions/blob/main/setup-gradle/README.md
@@ -34,6 +46,100 @@ jobs:
       run: |
         chmod +x ./gradlew
         ./gradlew setup
+        
+    - name: Apply Mojang patches (decompile+patch)
+      run: ./gradlew youer:applyPatches
+
+    - name: Normalize ACK variable for getSequence()
+      shell: bash
+      run: |
+        set -euo pipefail
+        T=projects/youer/src/main/java/net/minecraft/server/network/ServerGamePacketListenerImpl.java
+
+        # 從方法頭找參數名：handleUseItemOn(ServerboundUseItemOnPacket <VAR>)
+        VAR_FROM_HEADER="$(awk '
+          /handleUseItemOn[ \t]*\(/,/\)/ {
+            if ($0 ~ /ServerboundUseItemOnPacket/) {
+              for (i=1;i<=NF;i++) if ($i ~ /ServerboundUseItemOnPacket/) {
+                if (i+1<=NF) { v=$(i+1); gsub(/[,)\r;]/,"",v); print v; exit }
+              }
+            }
+          }
+        ' "$T")"
+
+        # 若頭找不到，再從已存在的呼叫點抓：<var>.getSequence()
+        if [ -z "${VAR_FROM_HEADER}" ]; then
+          VAR_FROM_CALL="$(grep -oP '[A-Za-z_][A-Za-z_0-9]*\s*\.\s*getSequence\(\)' "$T" | head -n1 | sed -E 's/\s//g;s/\.getSequence\(\)//')"
+        else
+          VAR_FROM_CALL=""
+        fi
+
+        SEQVAR="${VAR_FROM_HEADER:-$VAR_FROM_CALL}"
+        echo "Sequence var: ${SEQVAR:-<none>}"
+
+        if [ -n "${SEQVAR:-}" ]; then
+          # 1) 修正舊注入殘留的 packet.getSequence()
+          sed -i -E "s/\backBlockChangesUpTo\s*\(\s*packet\.getSequence\(\)\s*\)/ackBlockChangesUpTo(${SEQVAR}.getSequence())/g" "$T"
+          # 2) 若我們這次用了占位符 __SEQVAR__，也一併替換
+          sed -i "s/__SEQVAR__/${SEQVAR//\//\\/}/g" "$T"
+        else
+          # 找不到就刪掉 ACK 行，避免編譯錯，行為仍保護（保留 broadcastChanges()+return）
+          sed -i -E '/ackBlockChangesUpTo\s*\(\s*[A-Za-z_][A-Za-z_0-9]*\.getSequence\(\)\s*\)\s*;/d' "$T"
+          sed -i -E '/ackBlockChangesUpTo\s*\(\s*__SEQVAR__\.getSequence\(\)\s*\)\s*;/d' "$T"
+        fi
+
+
+        # 3) 嘗試偵測真正的參數變數名：handleUseItemOn(ServerboundUseItemOnPacket <VAR>)
+        VAR_FROM_HEADER="$(awk '
+          /void[ \t]+handleUseItemOn[ \t]*\(/,/\)/ {
+            if ($0 ~ /ServerboundUseItemOnPacket/) {
+              for (i=1;i<=NF;i++) {
+                if ($i ~ /ServerboundUseItemOnPacket/) {
+                  if (i+1<=NF) {
+                    v=$(i+1); gsub(/[),]/,"",v); print v; exit
+                  }
+                }
+              }
+            }
+          }
+        ' "$T")"
+
+        # 4) 如果找不到，嘗試從 getSequence() 的呼叫點抓變數名
+        if [ -z "${VAR_FROM_HEADER}" ]; then
+          VAR_FROM_CALL="$(grep -oP '[A-Za-z_][A-Za-z_0-9]*\s*\.\s*getSequence\(\)' "$T" | head -n1 | sed -E 's/\s//g;s/\.getSequence\(\)//')"
+        else
+          VAR_FROM_CALL=""
+        fi
+
+        SEQVAR="${VAR_FROM_HEADER:-$VAR_FROM_CALL}"
+        echo "Detected sequence var: ${SEQVAR:-<none>}"
+
+        if [ -n "${SEQVAR:-}" ]; then
+          # 用偵測到的變數替換占位符
+          sed -i "s/__SEQVAR__/${SEQVAR//\//\\/}/g" "$T"
+        else
+          # 找不到就移除 ACK 行，避免編譯錯
+          sed -i '/ackBlockChangesUpTo(__SEQVAR__\.getSequence())/d' "$T"
+          sed -i 's/__SEQVAR__\.getSequence()//g' "$T"
+        fi
+
+    - name: Generate patches
+      run: ./gradlew genPatches
+
+    - name: Commit regenerated patch (optional)
+      if: ${{ github.event_name != 'pull_request' }}
+      run: |
+        set -e
+        git status --porcelain
+        if ! git diff --quiet -- patches/net/minecraft/server/network/ServerGamePacketListenerImpl.java.patch; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add patches/net/minecraft/server/network/ServerGamePacketListenerImpl.java.patch
+          git commit -m "fix(youer): guard armor fallback on iron/gold + ACK to prevent dupes (Fixes #117)"
+          git push
+        else
+          echo "No patch changes to commit."
+        fi
 
     - name: Build with Gradle Wrapper
       run: ./gradlew youerJar
